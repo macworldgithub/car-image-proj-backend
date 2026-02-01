@@ -123,44 +123,49 @@ import serverless from "serverless-http";
 dotenv.config();
 
 const app = express();
-
-// Use memory storage so we can send buffers directly to OpenAI
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB per file
+  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
 });
 
-// Use cors middleware and explicitly handle preflight (OPTIONS)
-app.use(cors({ origin: true, methods: ["GET", "POST", "OPTIONS"], allowedHeaders: ["Content-Type", "Authorization"] }));
+// OPTIONAL: list of allowed frontends (production + localhost)
+const ALLOWED_ORIGINS = [
+  "https://image-compositor-pro.vercel.app", // your frontend production domain
+  "https://your-frontend-other-domain.vercel.app",
+  "http://localhost:8080", // dev
+];
 
-// Ensure OPTIONS for all routes returns the proper headers (covers serverless quirks)
-app.options("*", cors({ origin: true, methods: ["GET", "POST", "OPTIONS"], allowedHeaders: ["Content-Type", "Authorization"] }));
-
-// Extra safety: always set these headers so errors also carry CORS headers back to the browser
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*"); // or set a specific origin
+// small helper to set CORS headers
+function setCorsHeaders(res, originHeader) {
+  const origin = ALLOWED_ORIGINS.includes(originHeader) ? originHeader : "*";
+  res.setHeader("Access-Control-Allow-Origin", origin);
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
-  if (req.method === "OPTIONS") return res.sendStatus(200);
+  // if you expect credentials, set Access-Control-Allow-Credentials and don't use "*"
+}
+
+// Ensure Express will still have usual middleware (not strictly needed for multipart)
+app.use(cors({ origin: true, methods: ["GET", "POST", "OPTIONS"], allowedHeaders: ["Content-Type", "Authorization"] }));
+app.use((req, res, next) => {
+  // always set CORS headers for safety (also covers error paths)
+  setCorsHeaders(res, req.headers.origin);
   next();
 });
 
-// Healthcheck at /api/composite (GET)
 app.get("/", (req, res) => res.send("OpenAI composite backend running (Vercel)"));
 
+// POST route as before
 app.post(
   "/",
   upload.fields([
     { name: "car", maxCount: 1 },
     { name: "background", maxCount: 1 },
-    { name: "logo", maxCount: 1 }, // optional
+    { name: "logo", maxCount: 1 },
   ]),
   async (req, res) => {
     try {
       if (!req.files || !req.files.car || !req.files.background) {
-        return res
-          .status(400)
-          .json({ success: false, error: "Please upload both 'car' and 'background' files." });
+        return res.status(400).json({ success: false, error: "Please upload both 'car' and 'background' files." });
       }
 
       const carFile = req.files.car[0];
@@ -168,21 +173,15 @@ app.post(
       const logoFile = req.files.logo && req.files.logo[0] ? req.files.logo[0] : null;
 
       const form = new FormData();
-
-      // car first, background second (OpenAI edits API expects that ordering for image[]).
       form.append("image[]", carFile.buffer, { filename: carFile.originalname });
       form.append("image[]", bgFile.buffer, { filename: bgFile.originalname });
+      if (logoFile) form.append("image[]", logoFile.buffer, { filename: logoFile.originalname });
 
-      if (logoFile) {
-        form.append("image[]", logoFile.buffer, { filename: logoFile.originalname });
-      }
-
-      // Clear, explicit prompt...
       const promptLines = [
         "You are an image-editing assistant.",
         "Composite the first image (a car) onto the second image (the background).",
         "Place the car naturally into the background — match scale, perspective, lighting and shadows so the final image looks photorealistic.",
-        "Keep the full car visible and produce a single clean final image with no UI overlays, borders or text."
+        "Keep the full car visible and produce a single clean final image with no UI overlays, borders or text.",
       ];
 
       if (logoFile) {
@@ -215,24 +214,31 @@ app.post(
       });
 
       if (!openaiResp.data || !openaiResp.data.data || !openaiResp.data.data[0].b64_json) {
-        return res
-          .status(500)
-          .json({ success: false, error: "Unexpected response from OpenAI API", raw: openaiResp.data });
+        return res.status(500).json({ success: false, error: "Unexpected response from OpenAI API", raw: openaiResp.data });
       }
 
       const b64 = openaiResp.data.data[0].b64_json;
       const dataUrl = `data:image/png;base64,${b64}`;
-
       res.json({ success: true, image: dataUrl });
     } catch (err) {
       console.error("Error in /api/composite:", err?.response?.data ?? err.message ?? err);
       const openaiErr = err?.response?.data ?? null;
-      // ensure CORS header on error responses
-      res.setHeader("Access-Control-Allow-Origin", "*");
+      // make absolutely sure CORS headers are present even on errors
+      setCorsHeaders(res, req.headers.origin);
       res.status(500).json({ success: false, error: "Failed to composite images", details: openaiErr || err.message });
     }
   }
 );
 
-// Wrap the express app and export the handler for Vercel.
-export default serverless(app);
+// Create the serverless handler
+const handler = serverless(app);
+
+// Top-level export for Vercel: answer OPTIONS immediately (preflight)
+export default async function (req, res) {
+  // Always ensure CORS headers are present for the preflight
+  setCorsHeaders(res, req.headers.origin);
+  if (req.method === "OPTIONS") {
+    return res.status(200).end();
+  }
+  return handler(req, res);
+}
